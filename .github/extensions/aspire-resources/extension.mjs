@@ -2033,7 +2033,7 @@ const TRACES_APP_JS = `
       var source = firstSource(t);
       var detailUrl = t && t.dashboardUrl ? String(t.dashboardUrl) : '';
       var detailLink = detailUrl
-        ? '<button class="btn" onclick="openUrl(' + JSON.stringify(detailUrl) + ')">Open</button>'
+        ? '<button class="btn" data-url="' + attr(detailUrl) + '" onclick="openUrl(this.dataset.url)">Open</button>'
         : '<span class="muted">—</span>';
       return '<tr>' +
         '<td><div class="trace-title">' + text(title) + '</div><div class="muted mono">' + text(source) + '</div></td>' +
