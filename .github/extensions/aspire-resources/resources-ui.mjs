@@ -266,10 +266,10 @@ const HTML_TEMPLATE = `<!doctype html>
     #detail {
       border-top: 2px solid var(--kg-border);
       background: var(--background-color-subtle, var(--kg-panel));
-      flex-shrink: 0; min-height: 120px; height: 220px; max-height: 70vh; overflow: auto;
+      flex-shrink: 0; min-height: 120px; height: 220px; max-height: 70vh; overflow: hidden;
       display: none;
     }
-    #detail.open { display: block; }
+    #detail.open { display: flex; flex-direction: column; }
     .detail-resize-handle {
       height: 8px;
       cursor: ns-resize;
@@ -295,14 +295,14 @@ const HTML_TEMPLATE = `<!doctype html>
       color: var(--kg-muted); font-size: 15px;
     }
     .close-btn:hover { background: var(--kg-hover); }
-    .detail-body { padding: 12px 14px; display: grid; grid-template-columns: 1fr; gap: 12px; }
+    .detail-body { padding: 12px 14px; display: grid; grid-template-columns: 1fr; gap: 12px; align-content: start; flex: 1; min-height: 0; overflow: auto; }
     .detail-section h3 {
       font-size: 10px; font-weight: var(--font-weight-semibold,600);
       text-transform: uppercase; letter-spacing: 0.06em;
       color: var(--kg-muted); margin-bottom: 6px;
     }
-    .ep-list { max-height: 72px; overflow: auto; padding-right: 4px; }
-    .env-list { font-size: 11px; max-height: 170px; overflow: auto; padding-right: 4px; }
+    .ep-list { padding-right: 4px; }
+    .env-list { font-size: 11px; padding-right: 4px; }
     .env-row { display: flex; gap: 6px; padding: 1px 0; flex-wrap: wrap; }
     .env-key { font-family: var(--font-mono,monospace); color: var(--kg-fg); font-weight: 500; white-space: nowrap; }
     .env-val { font-family: var(--font-mono,monospace); color: var(--kg-muted); word-break: break-all; }
