@@ -1,25 +1,23 @@
 import { createServer } from "node:http";
-import { exec, spawn } from "node:child_process";
+import { spawn } from "node:child_process";
 import { access, readFile, readdir } from "node:fs/promises";
 import { basename, dirname, extname, join as pathJoin } from "node:path";
 import { homedir } from "node:os";
-import { promisify } from "node:util";
 import { joinSession, createCanvas } from "@github/copilot-sdk/extension";
-
-const execAsync = promisify(exec);
 
 // Per-instance state: server, url, SSE clients, polling interval, cached data
 const instances = new Map();
+const traceInstances = new Map();
 
 // ─── Aspire CLI helpers ─────────────────────────────────────────────────────
 
 async function listRunningAppHosts(cwd) {
+    const result = await runAspireCommand(["ps", "--format", "Json", "--non-interactive", "--nologo"], cwd, 10000);
+    if (!result.ok) {
+        return [];
+    }
     try {
-        const { stdout } = await execAsync("aspire ps --format Json --non-interactive --nologo", {
-            timeout: 10000,
-            cwd: cwd || process.cwd(),
-        });
-        const parsed = JSON.parse(stdout || "[]");
+        const parsed = JSON.parse(result.stdout || "[]");
         return Array.isArray(parsed) ? parsed : [];
     } catch {
         return [];
@@ -37,7 +35,8 @@ function normalizeRunningAppHosts(hosts, cwd) {
             const fromWorkspace = normalizedCwd ? apphostPath.startsWith(normalizedCwd + "/") : false;
             const defaultName = basename(dirname(apphostPath));
             const label = String(h?.appName || h?.displayName || h?.name || defaultName).trim() || defaultName;
-            return { apphostPath, label, fromWorkspace };
+            const dashboardUrl = String(h?.dashboardUrl || "").trim();
+            return { apphostPath, label, fromWorkspace, dashboardUrl };
         })
         .filter(Boolean);
 }
@@ -107,15 +106,22 @@ async function resolveEffectiveAppHost(apphost, cwd) {
     if (local?.apphostPath) {
         return { apphostPath: local.apphostPath, source: "workspace" };
     }
+    const fallback = candidates.find((h) => h.apphostPath);
+    if (fallback?.apphostPath) {
+        return { apphostPath: fallback.apphostPath, source: "running" };
+    }
     return null;
 }
 
-async function runAspireCommand(args, cwd, timeoutMs = 15000) {
+let _cachedAspireBinary = null;
+
+async function runBinaryCommand(binary, args, cwd, timeoutMs) {
     return new Promise((resolve) => {
-        const child = spawn("aspire", args, { cwd: cwd || process.cwd() });
+        const child = spawn(binary, args, { cwd: cwd || process.cwd() });
         let stdout = "";
         let stderr = "";
         let timedOut = false;
+        let spawnError = null;
         const timer = setTimeout(() => {
             timedOut = true;
             try { child.kill("SIGTERM"); } catch { }
@@ -131,57 +137,86 @@ async function runAspireCommand(args, cwd, timeoutMs = 15000) {
                 resolve({ ok: true, stdout: out, stderr: err });
                 return;
             }
+            if (spawnError?.code === "ENOENT") {
+                resolve({ ok: false, code: "cli_not_found", stdout: out, stderr: err, message: `${binary} not found` });
+                return;
+            }
             const fallback = timedOut ? `Command timed out (${timeoutMs}ms)` : `Command failed (${code})`;
-            resolve({ ok: false, stdout: out, stderr: err, message: (err || out || fallback).slice(0, 300) });
+            resolve({ ok: false, code: "error", stdout: out, stderr: err, message: (err || out || fallback).slice(0, 400) });
         });
         child.on("error", (e) => {
+            spawnError = e || null;
             clearTimeout(timer);
-            resolve({ ok: false, stdout: "", stderr: "", message: (e?.message || String(e)).slice(0, 300) });
+            if (e?.code === "ENOENT") {
+                resolve({ ok: false, code: "cli_not_found", stdout: "", stderr: "", message: `${binary} not found` });
+            } else {
+                resolve({ ok: false, code: "error", stdout: "", stderr: "", message: (e?.message || String(e)).slice(0, 400) });
+            }
         });
     });
 }
 
-async function fetchResources(apphost, cwd) {
-    const selected = await resolveEffectiveAppHost(apphost, cwd);
-    if (!selected?.apphostPath) {
-        return { ok: false, code: "no_apphost", message: "No running AppHost found in this workspace." };
+async function discoverAspireBinary(cwd) {
+    if (_cachedAspireBinary) return _cachedAspireBinary;
+    const shell = process.env.SHELL || "/bin/zsh";
+    const probe = await runBinaryCommand(shell, ["-ilc", "command -v aspire || true"], cwd, 8000);
+    if (!probe.ok) return null;
+    const found = String(probe.stdout || "").split(/\r?\n/).map((v) => v.trim()).find(Boolean);
+    if (!found) return null;
+    _cachedAspireBinary = found;
+    return found;
+}
+
+async function runAspireCommand(args, cwd, timeoutMs = 15000) {
+    const direct = await runBinaryCommand("aspire", args, cwd, timeoutMs);
+    if (direct.ok || direct.code !== "cli_not_found") {
+        return direct;
     }
 
-    const args = ["describe", "--format", "Json", "--non-interactive", "--nologo", "--apphost", selected.apphostPath];
-    const result = await runAspireCommand(args, cwd, 15000);
-    if (!result.ok) {
-        return { ok: false, code: "error", message: result.message };
+    const discovered = await discoverAspireBinary(cwd);
+    if (discovered) {
+        const viaShellPath = await runBinaryCommand(discovered, args, cwd, timeoutMs);
+        if (viaShellPath.ok || viaShellPath.code !== "cli_not_found") {
+            return viaShellPath;
+        }
     }
-    try {
-        const text = result.stdout.trim();
-        if (!text) return { ok: false, code: "no_apphost", message: "No running AppHost found in this workspace." };
-        const data = JSON.parse(text);
-        const resources = Array.isArray(data) ? data : (data.resources ?? data.items ?? []);
-        return { ok: true, resources, apphostPath: selected.apphostPath, apphostSource: selected.source };
-    } catch (e) {
-        const msg = (e.message || String(e));
-        return { ok: false, code: "error", message: msg.slice(0, 300) };
+
+    return {
+        ok: false,
+        code: "cli_not_found",
+        stdout: "",
+        stderr: "",
+        message: "Aspire CLI was not found. Install Aspire CLI or add it to PATH.",
+    };
+}
+
+async function ensureAspireCliAvailable(cwd) {
+    const result = await runAspireCommand(["--version"], cwd, 5000);
+    if (result.ok) return { ok: true };
+    if (result.code === "cli_not_found") {
+        return {
+            ok: false,
+            code: "cli_not_found",
+            message: "Aspire CLI was not found for this extension process. Add Aspire to PATH (or install it) and reload extensions.",
+        };
     }
+    return {
+        ok: false,
+        code: "error",
+        message: result.message || "Unable to run Aspire CLI.",
+    };
 }
 
 async function startAppHost(cwd) {
-    try {
-        await execAsync("aspire start --nologo --non-interactive", { timeout: 60000, cwd: cwd || process.cwd() });
+    const result = await runAspireCommand(["start", "--nologo", "--non-interactive"], cwd, 60000);
+    if (result.ok) {
         return { ok: true };
-    } catch (e) {
-        return { ok: false, message: (e.stderr || e.message || String(e)).slice(0, 500) };
     }
-}
-
-async function runResourceCommand(name, command, apphost, cwd) {
-    return runNamedResourceCommand(name, command, {}, apphost, cwd);
-}
-
-function toCliFlag(inputName) {
-    return "--" + String(inputName)
-        .replace(/([a-z0-9])([A-Z])/g, "$1-$2")
-        .replace(/[_\s]+/g, "-")
-        .toLowerCase();
+    return {
+        ok: false,
+        code: result.code || "error",
+        message: (result.message || "Failed to start AppHost.").slice(0, 500),
+    };
 }
 
 async function runNamedResourceCommand(name, command, commandArgs, apphost, cwd) {
@@ -202,31 +237,148 @@ async function runNamedResourceCommand(name, command, commandArgs, apphost, cwd)
         args.push(flag, String(value));
     }
 
-    return new Promise((resolve) => {
-        const child = spawn("aspire", args, { cwd: cwd || process.cwd() });
-        let stdout = "";
-        let stderr = "";
-        const timer = setTimeout(() => {
-            try { child.kill("SIGTERM"); } catch { }
-        }, 45000);
+    const result = await runAspireCommand(args, cwd, 45000);
+    if (result.ok) {
+        return { ok: true, stdout: result.stdout || "", stderr: result.stderr || "" };
+    }
+    return {
+        ok: false,
+        message: (result.message || "Command failed").slice(0, 2000),
+        stdout: result.stdout || "",
+        stderr: result.stderr || "",
+    };
+}
 
-        child.stdout?.on("data", (d) => { stdout += String(d); });
-        child.stderr?.on("data", (d) => { stderr += String(d); });
-        child.on("close", (code) => {
-            clearTimeout(timer);
-            const out = stdout.trim();
-            const err = stderr.trim();
-            if (code === 0) {
-                resolve({ ok: true, stdout: out, stderr: err });
-            } else {
-                resolve({ ok: false, message: (err || out || `Command failed (${code})`).slice(0, 2000), stdout: out, stderr: err });
-            }
-        });
-        child.on("error", (e) => {
-            clearTimeout(timer);
-            resolve({ ok: false, message: (e?.message || String(e)).slice(0, 2000), stdout: "", stderr: "" });
-        });
-    });
+async function fetchResources(apphost, cwd) {
+    const selected = await resolveEffectiveAppHost(apphost, cwd);
+    if (!selected?.apphostPath) {
+        const cli = await ensureAspireCliAvailable(cwd);
+        if (!cli.ok) {
+            return { ok: false, code: cli.code, message: cli.message };
+        }
+        return { ok: false, code: "no_apphost", message: "No running AppHost found in this workspace." };
+    }
+
+    const args = ["describe", "--format", "Json", "--non-interactive", "--nologo", "--apphost", selected.apphostPath];
+    const result = await runAspireCommand(args, cwd, 15000);
+    if (!result.ok) {
+        return { ok: false, code: result.code || "error", message: result.message };
+    }
+    try {
+        const text = result.stdout.trim();
+        if (!text) return { ok: false, code: "no_apphost", message: "No running AppHost found in this workspace." };
+        const data = JSON.parse(text);
+        const resources = Array.isArray(data) ? data : (data.resources ?? data.items ?? []);
+        return { ok: true, resources, apphostPath: selected.apphostPath, apphostSource: selected.source };
+    } catch (e) {
+        const msg = (e.message || String(e));
+        return { ok: false, code: "error", message: msg.slice(0, 300) };
+    }
+}
+
+function deriveDashboardUrls(items) {
+    const urls = (Array.isArray(items) ? items : [])
+        .map((x) => String(x?.dashboardUrl || "").trim())
+        .filter(Boolean);
+
+    if (!urls.length) {
+        return { dashboardBaseUrl: "", tracesUrl: "", logsUrl: "" };
+    }
+
+    let base = "";
+    try {
+        base = new URL(urls[0]).origin;
+    } catch {
+        base = urls[0].replace(/\/+$/, "");
+    }
+    return {
+        dashboardBaseUrl: base,
+        tracesUrl: `${base}/traces`,
+        logsUrl: `${base}/structuredlogs`,
+    };
+}
+
+async function fetchOtelTraces({ apphost, cwd, resource, limit = 50, hasError, search, traceId } = {}) {
+    const selected = await resolveEffectiveAppHost(apphost, cwd);
+    if (!selected?.apphostPath) {
+        const cli = await ensureAspireCliAvailable(cwd);
+        if (!cli.ok) return { ok: false, code: cli.code, message: cli.message };
+        return { ok: false, code: "no_apphost", message: "No running AppHost found in this workspace." };
+    }
+
+    const args = ["otel", "traces"];
+    if (resource) args.push(String(resource));
+    args.push("--apphost", selected.apphostPath, "--format", "Json", "--non-interactive", "--nologo");
+    if (Number.isFinite(limit) && Number(limit) > 0) args.push("-n", String(Math.floor(Number(limit))));
+    if (typeof hasError === "boolean") args.push("--has-error", String(hasError));
+    if (search) args.push("--search", String(search));
+    if (traceId) args.push("--trace-id", String(traceId));
+
+    const result = await runAspireCommand(args, cwd, 20000);
+    if (!result.ok) {
+        return { ok: false, code: result.code || "error", message: result.message || "Failed to query traces." };
+    }
+
+    try {
+        const traces = JSON.parse(result.stdout || "[]");
+        const links = deriveDashboardUrls(traces);
+        return {
+            ok: true,
+            traces: Array.isArray(traces) ? traces : [],
+            ...links,
+            apphostPath: selected.apphostPath,
+            apphostSource: selected.source,
+        };
+    } catch (e) {
+        return { ok: false, code: "parse_error", message: (e?.message || String(e)).slice(0, 300) };
+    }
+}
+
+async function fetchOtelLogs({ apphost, cwd, resource, limit = 50, severity, search, traceId } = {}) {
+    const selected = await resolveEffectiveAppHost(apphost, cwd);
+    if (!selected?.apphostPath) {
+        const cli = await ensureAspireCliAvailable(cwd);
+        if (!cli.ok) return { ok: false, code: cli.code, message: cli.message };
+        return { ok: false, code: "no_apphost", message: "No running AppHost found in this workspace." };
+    }
+
+    const args = ["otel", "logs"];
+    if (resource) args.push(String(resource));
+    args.push("--apphost", selected.apphostPath, "--format", "Json", "--non-interactive", "--nologo");
+    if (Number.isFinite(limit) && Number(limit) > 0) args.push("-n", String(Math.floor(Number(limit))));
+    if (severity) args.push("--severity", String(severity));
+    if (search) args.push("--search", String(search));
+    if (traceId) args.push("--trace-id", String(traceId));
+
+    const result = await runAspireCommand(args, cwd, 20000);
+    if (!result.ok) {
+        return { ok: false, code: result.code || "error", message: result.message || "Failed to query logs." };
+    }
+
+    try {
+        const logs = JSON.parse(result.stdout || "[]");
+        const links = deriveDashboardUrls(logs);
+        return {
+            ok: true,
+            logs: Array.isArray(logs) ? logs : [],
+            ...links,
+            apphostPath: selected.apphostPath,
+            apphostSource: selected.source,
+        };
+    } catch (e) {
+        return { ok: false, code: "parse_error", message: (e?.message || String(e)).slice(0, 300) };
+    }
+}
+
+async function runResourceCommand(name, command, apphost, cwd) {
+    return runNamedResourceCommand(name, command, {}, apphost, cwd);
+}
+
+function toCliFlag(inputName) {
+    return "--" + String(inputName)
+        .replace(/([a-z0-9])([A-Z])/g, "$1-$2")
+        .replace(/[_\s]+/g, "-")
+        .toLowerCase();
 }
 
 async function readJsonBody(req) {
@@ -695,6 +847,7 @@ const HTML_TEMPLATE = `<!doctype html>
     <span class="header-title">__APP_TITLE__</span>
     <div class="header-actions">
       <span id="liveDot" class="live-dot stale" title="SSE connection status"></span>
+      <a class="btn" id="dashboardBtn" href="#" target="_blank" rel="noopener" style="display:none">⎋ Open dashboard</a>
       <button class="btn" id="refreshBtn" onclick="doRefresh()">↻ Refresh</button>
     </div>
   </div>
@@ -1158,6 +1311,17 @@ const APP_JS = `
     el.className = 'status-text' + (isError ? ' error' : '');
   }
 
+  function updateDashboardBtn(url) {
+    var btn = document.getElementById('dashboardBtn');
+    if (!btn) return;
+    if (url) {
+      btn.href = url;
+      btn.style.display = '';
+    } else {
+      btn.style.display = 'none';
+    }
+  }
+
   function setResources(resources) {
     allResources = resources;
     noAppHostVisible = false;
@@ -1332,6 +1496,7 @@ const APP_JS = `
         .then(function(data) {
           if (data.ok) {
             setStatus('Using selected AppHost');
+            updateDashboardBtn(data.dashboardUrl || '');
             window.doRefresh();
           } else {
             setStatus(data.message || 'Failed to select AppHost', true);
@@ -1360,6 +1525,7 @@ const APP_JS = `
           return;
         }
         picker.innerHTML = renderAppHostPicker(data.apphosts || [], data.selectedApphost || '');
+        updateDashboardBtn(data.selectedDashboardUrl || '');
         if (startAction) {
           startAction.innerHTML = renderStartAction(!!data.canStartWorkspace);
           var startBtn = document.getElementById('startBtn');
@@ -1515,6 +1681,389 @@ const APP_JS = `
 })();
 `;
 
+const TRACES_HTML_TEMPLATE = `<!doctype html>
+<html><head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>__APP_TITLE__ Traces</title>
+  <style>
+    :root {
+      --kg-bg: var(--background-color-default, #fff);
+      --kg-fg: var(--text-color-default, #1f2328);
+      --kg-muted: var(--text-color-muted, #656d76);
+      --kg-border: var(--border-color-default, #d0d7de);
+      --kg-border-muted: color-mix(in srgb, var(--kg-border) 65%, transparent);
+      --kg-panel: color-mix(in srgb, var(--kg-fg) 6%, var(--kg-bg));
+      --kg-hover: var(--background-color-hover, color-mix(in srgb, var(--kg-fg) 9%, var(--kg-bg)));
+      --kg-accent: var(--color-accent-emphasis, var(--kg-fg));
+      --kg-danger-fg: var(--color-danger-fg, var(--true-color-red, #d1242f));
+      --kg-focus: var(--color-focus-outline, #0969da);
+    }
+    * { box-sizing: border-box; }
+    html, body { margin: 0; height: 100%; background: var(--kg-bg); color: var(--kg-fg); font: var(--text-body-medium, 14px)/var(--leading-body-medium, 20px) var(--font-sans, sans-serif); }
+    .header {
+      display: flex; align-items: center; gap: 10px;
+      padding: 10px 12px; border-bottom: 1px solid var(--kg-border);
+      position: sticky; top: 0; background: var(--kg-bg); z-index: 10;
+    }
+    .header-title { font-weight: var(--font-weight-semibold, 600); }
+    .grow { flex: 1; }
+    .row { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+    .btn, .select {
+      border: 1px solid var(--kg-border); border-radius: 6px;
+      padding: 6px 10px; background: var(--kg-bg); color: var(--kg-fg);
+      font: inherit;
+    }
+    .btn { text-decoration: none; cursor: pointer; }
+    .btn:hover { background: var(--kg-hover); }
+    .btn:focus-visible, .select:focus-visible {
+      outline: 2px solid var(--kg-focus); outline-offset: 1px;
+    }
+    .btn[aria-disabled="true"] { opacity: 0.45; pointer-events: none; }
+    .toolbar {
+      display: grid; gap: 10px; padding: 10px 12px;
+      border-bottom: 1px solid var(--kg-border); background: var(--background-color-subtle, var(--kg-panel));
+    }
+    .muted { color: var(--kg-muted); font-size: 12px; }
+    #statusText.err { color: var(--kg-danger-fg); }
+    #contentWrap { height: calc(100vh - 186px); min-height: 360px; overflow: auto; }
+    #empty {
+      display: grid; place-items: center; min-height: 200px;
+      color: var(--kg-muted); text-align: center; padding: 20px;
+    }
+    .table-wrap { padding: 8px 12px 14px; }
+    table { width: 100%; border-collapse: collapse; font-size: 12px; }
+    th, td { text-align: left; padding: 7px 8px; border-bottom: 1px solid var(--kg-border-muted); vertical-align: top; }
+    th { color: var(--kg-muted); font-size: 11px; text-transform: uppercase; letter-spacing: 0.04em; position: sticky; top: 0; background: var(--kg-bg); }
+    tr:hover td { background: var(--kg-hover); }
+    .trace-title { font-weight: var(--font-weight-semibold, 600); }
+    .mono { font-family: var(--font-mono, monospace); font-size: 11px; }
+    .badge {
+      display: inline-flex; align-items: center; gap: 6px;
+      border: 1px solid var(--kg-border); border-radius: 999px;
+      padding: 2px 8px; font-size: 11px;
+    }
+    .badge.ok { color: var(--kg-muted); }
+    .badge.err {
+      color: var(--kg-danger-fg);
+      border-color: color-mix(in srgb, var(--kg-danger-fg) 40%, var(--kg-border));
+      background: color-mix(in srgb, var(--kg-danger-fg) 12%, transparent);
+    }
+    .log-snapshot { margin: 0 12px 12px; border: 1px solid var(--kg-border); border-radius: 8px; }
+    .log-snapshot summary { cursor: pointer; padding: 8px 10px; color: var(--kg-muted); font-size: 12px; }
+    .log-snapshot pre {
+      margin: 0; border-top: 1px solid var(--kg-border-muted); padding: 10px;
+      font-size: 11px; max-height: 220px; overflow: auto; white-space: pre-wrap;
+      font-family: var(--font-mono, monospace);
+      background: var(--background-color-subtle, var(--kg-panel));
+    }
+  </style>
+</head><body>
+  <div class="header">
+    <span>__APP_EMOJI__</span>
+    <span class="header-title">__APP_TITLE__ Traces</span>
+    <span class="grow"></span>
+    <button class="btn" id="refreshBtn">↻ Refresh</button>
+  </div>
+  <div class="toolbar">
+    <div class="row">
+      <label for="apphostSelect" class="muted">AppHost:</label>
+      <select class="select" id="apphostSelect"></select>
+      <button class="btn" id="useApphostBtn">Use selected</button>
+      <span class="muted" id="statusText">Loading…</span>
+    </div>
+    <div class="row">
+      <label class="muted" for="resourceFilter">Resource:</label>
+      <input class="select" id="resourceFilter" placeholder="all resources" />
+      <label class="muted" for="searchFilter">Search:</label>
+      <input class="select" id="searchFilter" placeholder="http.method:GET, error, trace id..." />
+      <label class="muted" for="limitSelect">Limit:</label>
+      <select class="select" id="limitSelect">
+        <option value="20">20</option>
+        <option value="50" selected>50</option>
+        <option value="100">100</option>
+      </select>
+      <label class="muted"><input type="checkbox" id="errOnly" /> Errors only</label>
+      <button class="btn" id="fetchLogsBtn">Get logs snapshot</button>
+      <a class="btn" id="openTracesBtn" target="_blank" rel="noopener noreferrer" aria-disabled="true">Open traces in dashboard</a>
+      <a class="btn" id="openLogsBtn" target="_blank" rel="noopener noreferrer" aria-disabled="true">Open logs in dashboard</a>
+    </div>
+  </div>
+  <div id="contentWrap">
+    <div id="empty">No traces yet. Click refresh after your app receives traffic.</div>
+    <div class="table-wrap" id="tableWrap" style="display:none">
+      <table>
+        <thead>
+          <tr>
+            <th>Title</th>
+            <th>Trace ID</th>
+            <th>Duration</th>
+            <th>Time</th>
+            <th>Status</th>
+            <th>Details</th>
+          </tr>
+        </thead>
+        <tbody id="tracesBody"></tbody>
+      </table>
+    </div>
+    <details class="log-snapshot" id="logSnapshotWrap" style="display:none">
+      <summary>Latest logs snapshot</summary>
+      <pre id="logSnapshot"></pre>
+    </details>
+  </div>
+  <script src="/traces.js"></script>
+</body></html>`;
+
+function renderTracesHtml(branding) {
+    const safeTitle = escapeHtml(branding?.appName || "App");
+    const safeEmoji = escapeHtml(branding?.emoji || "🌱");
+    return TRACES_HTML_TEMPLATE
+        .replaceAll("__APP_TITLE__", safeTitle)
+        .replaceAll("__APP_EMOJI__", safeEmoji);
+}
+
+const TRACES_APP_JS = `
+(function() {
+  var current = null;
+  var currentLogs = [];
+
+  function setStatus(msg, isError) {
+    var el = document.getElementById('statusText');
+    if (!el) return;
+    el.textContent = msg || '';
+    el.className = isError ? 'err' : '';
+  }
+
+  function renderApphosts(items, selected) {
+    var select = document.getElementById('apphostSelect');
+    if (!select) return;
+    var hosts = Array.isArray(items) ? items : [];
+    if (!hosts.length) {
+      select.innerHTML = '<option value="">No running AppHosts</option>';
+      return;
+    }
+    select.innerHTML = hosts.map(function(host) {
+      var path = host.apphostPath || '';
+      var label = host.label || path || 'AppHost';
+      var scope = host.fromWorkspace ? ' (workspace)' : ' (other)';
+      var isSelected = selected && selected === path ? ' selected' : '';
+      return '<option value="' + attr(path) + '"' + isSelected + '>' + attr(label + scope) + '</option>';
+    }).join('');
+  }
+
+  function attr(s) {
+    return String(s || '').replace(/&/g, '&amp;').replace(/"/g, '&quot;').replace(/</g, '&lt;');
+  }
+
+  function text(s) {
+    return String(s || '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+  }
+
+  function setButtonLink(id, href) {
+    var el = document.getElementById(id);
+    if (!el) return;
+    if (href) {
+      el.href = href;
+      el.setAttribute('aria-disabled', 'false');
+    } else {
+      el.removeAttribute('href');
+      el.setAttribute('aria-disabled', 'true');
+    }
+  }
+
+  function setEmpty(message) {
+    var tableWrap = document.getElementById('tableWrap');
+    var body = document.getElementById('tracesBody');
+    var empty = document.getElementById('empty');
+    if (body) body.innerHTML = '';
+    if (tableWrap) tableWrap.style.display = 'none';
+    if (empty) { empty.textContent = message || 'No traces found.'; empty.style.display = 'grid'; }
+  }
+
+  function fmtDuration(ms) {
+    var n = Number(ms || 0);
+    if (!isFinite(n)) return '—';
+    if (n >= 1000) return (n / 1000).toFixed(2) + 's';
+    return n.toFixed(0) + 'ms';
+  }
+
+  function fmtTime(ts) {
+    if (!ts) return '—';
+    var d = new Date(ts);
+    if (!isFinite(d.getTime())) return String(ts);
+    return d.toLocaleTimeString();
+  }
+
+  function firstSource(trace) {
+    var spans = Array.isArray(trace && trace.spans) ? trace.spans : [];
+    var s = spans.find(function(x) { return x && x.source; });
+    return (s && s.source) ? String(s.source) : '';
+  }
+
+  function renderTraces(traces) {
+    var rows = Array.isArray(traces) ? traces : [];
+    var body = document.getElementById('tracesBody');
+    var tableWrap = document.getElementById('tableWrap');
+    var empty = document.getElementById('empty');
+    if (!body || !tableWrap || !empty) return;
+    if (!rows.length) {
+      setEmpty('No traces found for the current filters.');
+      return;
+    }
+    body.innerHTML = rows.map(function(t) {
+      var traceId = t && t.traceId ? String(t.traceId) : '';
+      var title = t && t.title ? String(t.title) : '(untitled trace)';
+      var status = t && t.hasError ? '<span class="badge err">Error</span>' : '<span class="badge ok">OK</span>';
+      var source = firstSource(t);
+      var detailUrl = t && t.dashboardUrl ? String(t.dashboardUrl) : '';
+      var detailLink = detailUrl
+        ? '<a class="btn" href="' + attr(detailUrl) + '" target="_blank" rel="noopener noreferrer">Open</a>'
+        : '<span class="muted">—</span>';
+      return '<tr>' +
+        '<td><div class="trace-title">' + text(title) + '</div><div class="muted mono">' + text(source) + '</div></td>' +
+        '<td class="mono">' + text(traceId) + '</td>' +
+        '<td>' + text(fmtDuration(t && t.durationMs)) + '</td>' +
+        '<td>' + text(fmtTime(t && t.timestamp)) + '</td>' +
+        '<td>' + status + '</td>' +
+        '<td>' + detailLink + '</td>' +
+      '</tr>';
+    }).join('');
+    empty.style.display = 'none';
+    tableWrap.style.display = 'block';
+  }
+
+  function renderLinks(data) {
+    current = data || null;
+    setButtonLink('openTracesBtn', data && data.tracesUrl ? data.tracesUrl : '');
+    setButtonLink('openLogsBtn', data && data.logsUrl ? data.logsUrl : '');
+  }
+
+  function tracesQuery() {
+    var params = new URLSearchParams();
+    var resource = document.getElementById('resourceFilter');
+    var search = document.getElementById('searchFilter');
+    var limit = document.getElementById('limitSelect');
+    var errOnly = document.getElementById('errOnly');
+    if (resource && resource.value.trim()) params.set('resource', resource.value.trim());
+    if (search && search.value.trim()) params.set('search', search.value.trim());
+    if (limit && limit.value) params.set('limit', limit.value);
+    if (errOnly && errOnly.checked) params.set('hasError', 'true');
+    return params.toString();
+  }
+
+  function refresh() {
+    setStatus('Refreshing traces…');
+    var qs = tracesQuery();
+    fetch('/api/traces' + (qs ? ('?' + qs) : ''))
+      .then(function(r) { return r.json(); })
+      .then(function(data) {
+        if (data && data.ok) {
+          renderLinks(data);
+          renderTraces(data.traces || []);
+          setStatus('Loaded ' + ((data.traces && data.traces.length) || 0) + ' traces from ' + (data.apphostPath || 'AppHost'));
+        } else if (data && data.code === 'no_apphost') {
+          renderLinks(null);
+          setEmpty('No running AppHost found.');
+          setStatus('No running AppHost found', true);
+        } else {
+          renderLinks(null);
+          setEmpty((data && data.message) || 'Failed to refresh traces.');
+          setStatus((data && data.message) || 'Failed to refresh traces', true);
+        }
+      })
+      .catch(function() {
+        renderLinks(null);
+        setEmpty('Failed to refresh traces.');
+        setStatus('Failed to refresh traces', true);
+      });
+  }
+
+  function fetchLogsSnapshot() {
+    setStatus('Fetching logs snapshot…');
+    var params = new URLSearchParams();
+    var resource = document.getElementById('resourceFilter');
+    var search = document.getElementById('searchFilter');
+    if (resource && resource.value.trim()) params.set('resource', resource.value.trim());
+    if (search && search.value.trim()) params.set('search', search.value.trim());
+    params.set('limit', '50');
+    fetch('/api/logs?' + params.toString())
+      .then(function(r) { return r.json(); })
+      .then(function(data) {
+        var wrap = document.getElementById('logSnapshotWrap');
+        var pre = document.getElementById('logSnapshot');
+        if (!wrap || !pre) return;
+        if (data && data.ok) {
+          currentLogs = Array.isArray(data.logs) ? data.logs : [];
+          pre.textContent = currentLogs.map(function(log) {
+            var sev = log && log.severity ? '[' + log.severity + '] ' : '';
+            var res = log && log.resourceName ? log.resourceName + ': ' : '';
+            var msg = log && (log.message || (log.attributes && log.attributes['log.message'])) ? (log.message || log.attributes['log.message']) : '(empty)';
+            return sev + res + msg;
+          }).join('\\n');
+          wrap.style.display = 'block';
+          wrap.open = true;
+          if (!current || !current.logsUrl) setButtonLink('openLogsBtn', data.logsUrl || '');
+          setStatus('Fetched ' + currentLogs.length + ' logs');
+        } else {
+          setStatus((data && data.message) || 'Failed to fetch logs snapshot', true);
+        }
+      })
+      .catch(function() {
+        setStatus('Failed to fetch logs snapshot', true);
+      });
+  }
+
+  function loadApphosts() {
+    fetch('/api/apphosts')
+      .then(function(r) { return r.json(); })
+      .then(function(data) {
+        if (!data || !data.ok) {
+          renderApphosts([], '');
+          return;
+        }
+        renderApphosts(data.apphosts || [], data.selectedApphost || '');
+      })
+      .catch(function() {
+        renderApphosts([], '');
+      });
+  }
+
+  function useSelectedApphost() {
+    var select = document.getElementById('apphostSelect');
+    var apphost = select && select.value ? select.value : '';
+    setStatus('Updating AppHost…');
+    fetch('/api/select-apphost', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ apphost: apphost })
+    })
+      .then(function(r) { return r.json(); })
+      .then(function(data) {
+        if (data && data.ok) {
+          loadApphosts();
+          refresh();
+        } else {
+          setStatus((data && data.message) || 'Failed to set AppHost', true);
+        }
+      })
+      .catch(function() {
+        setStatus('Failed to set AppHost', true);
+      });
+  }
+
+  document.getElementById('refreshBtn').addEventListener('click', refresh);
+  document.getElementById('useApphostBtn').addEventListener('click', useSelectedApphost);
+  document.getElementById('fetchLogsBtn').addEventListener('click', fetchLogsSnapshot);
+  document.getElementById('resourceFilter').addEventListener('keydown', function(evt) { if (evt.key === 'Enter') refresh(); });
+  document.getElementById('searchFilter').addEventListener('keydown', function(evt) { if (evt.key === 'Enter') refresh(); });
+  document.getElementById('limitSelect').addEventListener('change', refresh);
+  document.getElementById('errOnly').addEventListener('change', refresh);
+
+  loadApphosts();
+  refresh();
+})();
+`;
+
 // ─── Per-instance HTTP server ─────────────────────────────────────────────────
 
 async function startServer(instanceId, apphost, cwd, branding) {
@@ -1558,8 +2107,9 @@ async function startServer(instanceId, apphost, cwd, branding) {
         if (req.method === "GET" && path === "/api/apphosts") {
             const apphosts = await listAppHostCandidates(cwd);
             const canStartWorkspace = await canStartWorkspaceAppHost(cwd);
+            const selectedDashboardUrl = (apphosts.find((h) => h.apphostPath === selectedApphost) || {}).dashboardUrl || "";
             res.writeHead(200, { "Content-Type": "application/json" });
-            return res.end(JSON.stringify({ ok: true, apphosts, selectedApphost: selectedApphost || "", canStartWorkspace }));
+            return res.end(JSON.stringify({ ok: true, apphosts, selectedApphost: selectedApphost || "", selectedDashboardUrl, canStartWorkspace }));
         }
 
         if (req.method === "POST" && path === "/api/select-apphost") {
@@ -1593,7 +2143,7 @@ async function startServer(instanceId, apphost, cwd, branding) {
                 broadcast(sseClients, { type: "error", code: result.code, message: result.message });
             }
             res.writeHead(200, { "Content-Type": "application/json" });
-            return res.end(JSON.stringify({ ok: true, selectedApphost }));
+            return res.end(JSON.stringify({ ok: true, selectedApphost, dashboardUrl: found.dashboardUrl || "" }));
         }
 
         if (req.method === "GET" && path === "/events") {
@@ -1662,6 +2212,90 @@ async function startServer(instanceId, apphost, cwd, branding) {
     const addr = server.address();
     const port = typeof addr === "object" && addr ? addr.port : 0;
     return { server, url: `http://127.0.0.1:${port}/`, sseClients, title: branding?.title || "App Resources" };
+}
+
+async function startTracesServer(instanceId, apphost, cwd, branding) {
+    let selectedApphost = apphost || null;
+
+    const server = createServer(async (req, res) => {
+        const url = new URL(req.url || "/", "http://localhost");
+        const path = url.pathname;
+
+        if (req.method === "GET" && path === "/") {
+            res.writeHead(200, { "Content-Type": "text/html; charset=utf-8" });
+            return res.end(renderTracesHtml(branding));
+        }
+
+        if (req.method === "GET" && path === "/traces.js") {
+            res.writeHead(200, { "Content-Type": "application/javascript; charset=utf-8" });
+            return res.end(TRACES_APP_JS);
+        }
+
+        if (req.method === "GET" && path === "/api/traces") {
+            const limitRaw = Number.parseInt(url.searchParams.get("limit") || "", 10);
+            const hasErrorRaw = url.searchParams.get("hasError");
+            const hasError = hasErrorRaw === "true" ? true : hasErrorRaw === "false" ? false : undefined;
+            const links = await fetchOtelTraces({
+                apphost: selectedApphost,
+                cwd,
+                resource: url.searchParams.get("resource") || undefined,
+                limit: Number.isFinite(limitRaw) ? limitRaw : 50,
+                hasError,
+                search: url.searchParams.get("search") || undefined,
+                traceId: url.searchParams.get("traceId") || undefined,
+            });
+            res.writeHead(200, { "Content-Type": "application/json" });
+            return res.end(JSON.stringify(links));
+        }
+
+        if (req.method === "GET" && path === "/api/logs") {
+            const limitRaw = Number.parseInt(url.searchParams.get("limit") || "", 10);
+            const logs = await fetchOtelLogs({
+                apphost: selectedApphost,
+                cwd,
+                resource: url.searchParams.get("resource") || undefined,
+                limit: Number.isFinite(limitRaw) ? limitRaw : 50,
+                severity: url.searchParams.get("severity") || undefined,
+                search: url.searchParams.get("search") || undefined,
+                traceId: url.searchParams.get("traceId") || undefined,
+            });
+            res.writeHead(200, { "Content-Type": "application/json" });
+            return res.end(JSON.stringify(logs));
+        }
+
+        if (req.method === "GET" && path === "/api/apphosts") {
+            const apphosts = await listAppHostCandidates(cwd);
+            res.writeHead(200, { "Content-Type": "application/json" });
+            return res.end(JSON.stringify({ ok: true, apphosts, selectedApphost: selectedApphost || "" }));
+        }
+
+        if (req.method === "POST" && path === "/api/select-apphost") {
+            const body = await readJsonBody(req);
+            const requested = String(body?.apphost || "").trim();
+            if (!requested) {
+                selectedApphost = null;
+                res.writeHead(200, { "Content-Type": "application/json" });
+                return res.end(JSON.stringify({ ok: true, selectedApphost: "" }));
+            }
+            const candidates = await listAppHostCandidates(cwd);
+            const found = candidates.find((h) => h.apphostPath === requested);
+            if (!found) {
+                res.writeHead(400, { "Content-Type": "application/json" });
+                return res.end(JSON.stringify({ ok: false, message: "Selected AppHost is no longer running." }));
+            }
+            selectedApphost = found.apphostPath;
+            res.writeHead(200, { "Content-Type": "application/json" });
+            return res.end(JSON.stringify({ ok: true, selectedApphost }));
+        }
+
+        res.writeHead(404);
+        res.end("Not found");
+    });
+
+    await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+    const addr = server.address();
+    const port = typeof addr === "object" && addr ? addr.port : 0;
+    return { server, url: `http://127.0.0.1:${port}/`, title: `${branding?.appName || "App"} Traces` };
 }
 
 // ─── Canvas definition ────────────────────────────────────────────────────────
@@ -1789,6 +2423,58 @@ const session = await joinSession({
                     for (const res of entry.sseClients) {
                         try { res.end(); } catch {}
                     }
+                    await new Promise((resolve) => entry.server.close(() => resolve()));
+                }
+            },
+        }),
+        createCanvas({
+            id: "aspire-traces",
+            displayName: "Aspire Traces",
+            description: "Trace-focused Aspire canvas powered by Aspire CLI otel commands. Shows live trace results in-canvas and offers quick trace/log links.",
+            inputSchema: {
+                type: "object",
+                properties: {
+                    apphost: {
+                        type: "string",
+                        description: "Optional path to the AppHost project file. Auto-detected when omitted.",
+                    },
+                    appName: {
+                        type: "string",
+                        description: "Optional app name used in the traces canvas title.",
+                    },
+                    emoji: {
+                        type: "string",
+                        description: "Optional emoji used in the traces canvas title.",
+                    },
+                },
+                additionalProperties: false,
+            },
+            actions: [
+                {
+                    name: "refresh",
+                    description: "Query latest traces via Aspire CLI otel and return trace records plus dashboard links.",
+                    handler: async (ctx) => {
+                        const apphost = ctx.input?.apphost;
+                        const cwd = await getProjectCwd();
+                        return fetchOtelTraces({ apphost, cwd, limit: 50 });
+                    },
+                },
+            ],
+            open: async (ctx) => {
+                let entry = traceInstances.get(ctx.instanceId);
+                if (!entry) {
+                    const apphost = ctx.input?.apphost;
+                    const cwd = await getProjectCwd();
+                    const branding = await resolveBranding({ cwd, apphost, input: ctx.input });
+                    entry = await startTracesServer(ctx.instanceId, apphost, cwd, branding);
+                    traceInstances.set(ctx.instanceId, entry);
+                }
+                return { title: entry.title, url: entry.url };
+            },
+            onClose: async (ctx) => {
+                const entry = traceInstances.get(ctx.instanceId);
+                if (entry) {
+                    traceInstances.delete(ctx.instanceId);
                     await new Promise((resolve) => entry.server.close(() => resolve()));
                 }
             },
