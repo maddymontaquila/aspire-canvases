@@ -1886,8 +1886,8 @@ const TRACES_HTML_TEMPLATE = `<!doctype html>
       </select>
       <label class="muted"><input type="checkbox" id="errOnly" /> Errors only</label>
       <button class="btn" id="fetchLogsBtn">Get logs snapshot</button>
-      <a class="btn" id="openTracesBtn" target="_blank" rel="noopener noreferrer" aria-disabled="true">Open traces in dashboard</a>
-      <a class="btn" id="openLogsBtn" target="_blank" rel="noopener noreferrer" aria-disabled="true">Open logs in dashboard</a>
+      <button class="btn" id="openTracesBtn" aria-disabled="true" onclick="openBtnUrl(this)">Open traces in dashboard</button>
+      <button class="btn" id="openLogsBtn" aria-disabled="true" onclick="openBtnUrl(this)">Open logs in dashboard</button>
     </div>
   </div>
   <div id="contentWrap">
@@ -1960,14 +1960,29 @@ const TRACES_APP_JS = `
     return String(s || '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
   }
 
+  function openUrl(url) {
+    if (!url) return;
+    fetch('/api/open-url', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ url: url }),
+    }).catch(function() {});
+  }
+  window.openUrl = openUrl;
+
+  window.openBtnUrl = function(btn) {
+    if (!btn || btn.getAttribute('aria-disabled') === 'true') return;
+    openUrl(btn.dataset.url || '');
+  };
+
   function setButtonLink(id, href) {
     var el = document.getElementById(id);
     if (!el) return;
     if (href) {
-      el.href = href;
+      el.dataset.url = href;
       el.setAttribute('aria-disabled', 'false');
     } else {
-      el.removeAttribute('href');
+      delete el.dataset.url;
       el.setAttribute('aria-disabled', 'true');
     }
   }
@@ -2018,7 +2033,7 @@ const TRACES_APP_JS = `
       var source = firstSource(t);
       var detailUrl = t && t.dashboardUrl ? String(t.dashboardUrl) : '';
       var detailLink = detailUrl
-        ? '<a class="btn" href="' + attr(detailUrl) + '" target="_blank" rel="noopener noreferrer">Open</a>'
+        ? '<button class="btn" onclick="openUrl(' + JSON.stringify(detailUrl) + ')">Open</button>'
         : '<span class="muted">—</span>';
       return '<tr>' +
         '<td><div class="trace-title">' + text(title) + '</div><div class="muted mono">' + text(source) + '</div></td>' +
@@ -2342,6 +2357,18 @@ async function startTracesServer(instanceId, apphost, cwd, branding) {
         if (req.method === "GET" && path === "/traces.js") {
             res.writeHead(200, { "Content-Type": "application/javascript; charset=utf-8" });
             return res.end(TRACES_APP_JS);
+        }
+
+        if (req.method === "POST" && path === "/api/open-url") {
+            const body = await readJsonBody(req);
+            const url2 = String(body?.url || "").trim();
+            res.writeHead(200, { "Content-Type": "application/json" });
+            if (url2.startsWith("http://") || url2.startsWith("https://")) {
+                const opener = process.platform === "win32" ? "cmd" : process.platform === "darwin" ? "open" : "xdg-open";
+                const args = process.platform === "win32" ? ["/c", "start", url2] : [url2];
+                spawn(opener, args, { detached: true, stdio: "ignore" });
+            }
+            return res.end(JSON.stringify({ ok: true }));
         }
 
         if (req.method === "GET" && path === "/api/traces") {
