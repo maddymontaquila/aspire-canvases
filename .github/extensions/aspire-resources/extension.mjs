@@ -541,6 +541,7 @@ const HTML_TEMPLATE = `<!doctype html>
       border: 1px solid var(--kg-border);
       background: var(--kg-bg);
       color: var(--kg-fg);
+      text-decoration: none;
       transition: background 0.1s;
       white-space: nowrap;
     }
@@ -860,7 +861,6 @@ const HTML_TEMPLATE = `<!doctype html>
     <div class="header-actions">
       <span id="liveDot" class="live-dot stale" title="SSE connection status"></span>
       <a class="btn" id="dashboardBtn" href="#" target="_blank" rel="noopener" style="display:none">⎋ Open dashboard</a>
-      <button class="btn" id="changeApphostBtn" onclick="showApphostSwitcher()" title="Switch AppHost">⇄ AppHost</button>
       <button class="btn" id="refreshBtn" onclick="doRefresh()">↻ Refresh</button>
     </div>
   </div>
