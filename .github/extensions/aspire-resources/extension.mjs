@@ -106,10 +106,6 @@ async function resolveEffectiveAppHost(apphost, cwd) {
     if (local?.apphostPath) {
         return { apphostPath: local.apphostPath, source: "workspace" };
     }
-    const fallback = candidates.find((h) => h.apphostPath);
-    if (fallback?.apphostPath) {
-        return { apphostPath: fallback.apphostPath, source: "running" };
-    }
     return null;
 }
 
@@ -840,6 +836,22 @@ const HTML_TEMPLATE = `<!doctype html>
       max-height: 220px;
       overflow: auto;
     }
+    #apphostModal {
+      position: fixed; inset: 0; display: none; align-items: center; justify-content: center;
+      background: color-mix(in srgb, var(--kg-bg) 35%, transparent);
+      z-index: 31;
+    }
+    #apphostModal.open { display: flex; }
+    .apphost-modal-card {
+      width: min(480px, calc(100vw - 24px));
+      background: var(--kg-bg);
+      border: 1px solid var(--kg-border);
+      border-radius: 10px;
+      box-shadow: 0 10px 28px color-mix(in srgb, var(--kg-fg) 18%, transparent);
+      padding: 16px;
+    }
+    .apphost-modal-hdr { display: flex; align-items: center; gap: 8px; margin-bottom: 12px; }
+    .apphost-modal-title { flex: 1; font-weight: var(--font-weight-semibold, 600); }
   </style>
 </head><body>
   <div class="header">
@@ -848,6 +860,7 @@ const HTML_TEMPLATE = `<!doctype html>
     <div class="header-actions">
       <span id="liveDot" class="live-dot stale" title="SSE connection status"></span>
       <a class="btn" id="dashboardBtn" href="#" target="_blank" rel="noopener" style="display:none">⎋ Open dashboard</a>
+      <button class="btn" id="changeApphostBtn" onclick="showApphostSwitcher()" title="Switch AppHost">⇄ AppHost</button>
       <button class="btn" id="refreshBtn" onclick="doRefresh()">↻ Refresh</button>
     </div>
   </div>
@@ -860,6 +873,7 @@ const HTML_TEMPLATE = `<!doctype html>
   </div>
   <div id="detail"></div>
   <div id="commandModal"></div>
+  <div id="apphostModal"></div>
   <script src="/app.js"></script>
 </body></html>`;
 
@@ -1282,8 +1296,11 @@ const APP_JS = `
   document.getElementById('commandModal').addEventListener('click', function(evt) {
     if (evt.target && evt.target.id === 'commandModal') window.closeCommandModal();
   });
+  document.getElementById('apphostModal').addEventListener('click', function(evt) {
+    if (evt.target && evt.target.id === 'apphostModal') window.closeApphostModal();
+  });
   document.addEventListener('keydown', function(evt) {
-    if (evt.key === 'Escape') window.closeCommandModal();
+    if (evt.key === 'Escape') { window.closeCommandModal(); window.closeApphostModal(); }
   });
 
   function applyFilter() {
@@ -1321,6 +1338,78 @@ const APP_JS = `
       btn.style.display = 'none';
     }
   }
+
+  window.showApphostSwitcher = function() {
+    var modal = document.getElementById('apphostModal');
+    if (!modal) return;
+    modal.innerHTML =
+      '<div class="apphost-modal-card">' +
+        '<div class="apphost-modal-hdr">' +
+          '<span class="apphost-modal-title">Switch AppHost</span>' +
+          '<button class="btn" onclick="window.closeApphostModal()">✕</button>' +
+        '</div>' +
+        '<div id="apphostModalPicker"><span class="muted" style="font-size:12px">Checking for running AppHosts…</span></div>' +
+        '<div id="apphostModalStart"></div>' +
+      '</div>';
+    modal.className = 'open';
+    fetch('/api/apphosts')
+      .then(function(r) { return r.json(); })
+      .then(function(data) {
+        var pickerEl = document.getElementById('apphostModalPicker');
+        var startEl = document.getElementById('apphostModalStart');
+        if (!data || !data.ok || !pickerEl) return;
+        pickerEl.innerHTML = renderAppHostPicker(data.apphosts || [], data.selectedApphost || '');
+        updateDashboardBtn(data.selectedDashboardUrl || '');
+        if (startEl) {
+          startEl.innerHTML = renderStartAction(!!data.canStartWorkspace);
+          var startBtn = document.getElementById('startBtn');
+          if (startBtn) startBtn.addEventListener('click', function() { window.closeApphostModal(); window.doStart(); });
+        }
+        var useBtn = document.getElementById('useAppHostBtn');
+        var select = document.getElementById('apphostSelect');
+        if (select) {
+          select.addEventListener('change', updateApphostPathPreview);
+          updateApphostPathPreview();
+        }
+        if (useBtn) {
+          useBtn.addEventListener('click', function() {
+            var apphost = select && select.value ? select.value : '';
+            if (!apphost) return;
+            useBtn.disabled = true;
+            fetch('/api/select-apphost', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ apphost: apphost }),
+            })
+              .then(function(r) { return r.json(); })
+              .then(function(d) {
+                if (d.ok) {
+                  updateDashboardBtn(d.dashboardUrl || '');
+                  window.closeApphostModal();
+                  setStatus('Using selected AppHost');
+                  window.doRefresh();
+                } else {
+                  setStatus(d.message || 'Failed to select AppHost', true);
+                  useBtn.disabled = false;
+                }
+              })
+              .catch(function() {
+                setStatus('Failed to select AppHost', true);
+                useBtn.disabled = false;
+              });
+          });
+        }
+      })
+      .catch(function() {
+        var pickerEl = document.getElementById('apphostModalPicker');
+        if (pickerEl) pickerEl.innerHTML = '<span class="muted" style="font-size:12px">Unable to list running AppHosts.</span>';
+      });
+  };
+
+  window.closeApphostModal = function() {
+    var modal = document.getElementById('apphostModal');
+    if (modal) modal.className = '';
+  };
 
   function setResources(resources) {
     allResources = resources;
