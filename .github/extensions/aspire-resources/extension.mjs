@@ -1838,6 +1838,7 @@ const TRACES_HTML_TEMPLATE = `<!doctype html>
     th { color: var(--kg-muted); font-size: 11px; text-transform: uppercase; letter-spacing: 0.04em; position: sticky; top: 0; background: var(--kg-bg); }
     tr:hover td { background: var(--kg-hover); }
     .trace-title { font-weight: var(--font-weight-semibold, 600); }
+    tbody tr:hover td { background: var(--kg-hover); }
     .mono { font-family: var(--font-mono, monospace); font-size: 11px; }
     .badge {
       display: inline-flex; align-items: center; gap: 6px;
@@ -1925,7 +1926,6 @@ const TRACES_HTML_TEMPLATE = `<!doctype html>
             <th>Duration</th>
             <th>Time</th>
             <th>Status</th>
-            <th>Details</th>
           </tr>
         </thead>
         <tbody id="tracesBody"></tbody>
@@ -2105,16 +2105,12 @@ const TRACES_APP_JS = `
       var title = t && t.title ? String(t.title) : '(untitled trace)';
       var status = t && t.hasError ? '<span class="badge err">Error</span>' : '<span class="badge ok">OK</span>';
       var source = firstSource(t);
-      var detailBtn = traceId
-        ? '<button class="btn" data-traceid="' + attr(traceId) + '" onclick="window.showDetail(this.dataset.traceid)">Details</button>'
-        : '<span class="muted">—</span>';
-      return '<tr>' +
+      return '<tr style="cursor:pointer" onclick="window.showDetail(\'' + attr(traceId) + '\')">' +
         '<td><div class="trace-title">' + text(title) + '</div><div class="muted mono">' + text(source) + '</div></td>' +
         '<td class="mono">' + text(traceId) + '</td>' +
         '<td>' + text(fmtDuration(t && t.durationMs)) + '</td>' +
         '<td>' + text(fmtTime(t && t.timestamp)) + '</td>' +
         '<td>' + status + '</td>' +
-        '<td>' + detailBtn + '</td>' +
       '</tr>';
     }).join('');
     empty.style.display = 'none';
