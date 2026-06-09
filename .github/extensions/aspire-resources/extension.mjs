@@ -110,6 +110,37 @@ async function resolveEffectiveAppHost(apphost, cwd) {
     return null;
 }
 
+async function runAspireCommand(args, cwd, timeoutMs = 15000) {
+    return new Promise((resolve) => {
+        const child = spawn("aspire", args, { cwd: cwd || process.cwd() });
+        let stdout = "";
+        let stderr = "";
+        let timedOut = false;
+        const timer = setTimeout(() => {
+            timedOut = true;
+            try { child.kill("SIGTERM"); } catch { }
+        }, timeoutMs);
+
+        child.stdout?.on("data", (d) => { stdout += String(d); });
+        child.stderr?.on("data", (d) => { stderr += String(d); });
+        child.on("close", (code) => {
+            clearTimeout(timer);
+            const out = stdout.trim();
+            const err = stderr.trim();
+            if (code === 0) {
+                resolve({ ok: true, stdout: out, stderr: err });
+                return;
+            }
+            const fallback = timedOut ? `Command timed out (${timeoutMs}ms)` : `Command failed (${code})`;
+            resolve({ ok: false, stdout: out, stderr: err, message: (err || out || fallback).slice(0, 300) });
+        });
+        child.on("error", (e) => {
+            clearTimeout(timer);
+            resolve({ ok: false, stdout: "", stderr: "", message: (e?.message || String(e)).slice(0, 300) });
+        });
+    });
+}
+
 async function fetchResources(apphost, cwd) {
     const selected = await resolveEffectiveAppHost(apphost, cwd);
     if (!selected?.apphostPath) {
@@ -117,18 +148,18 @@ async function fetchResources(apphost, cwd) {
     }
 
     const args = ["describe", "--format", "Json", "--non-interactive", "--nologo", "--apphost", selected.apphostPath];
+    const result = await runAspireCommand(args, cwd, 15000);
+    if (!result.ok) {
+        return { ok: false, code: "error", message: result.message };
+    }
     try {
-        const { stdout } = await execAsync(`aspire ${args.join(" ")}`, {
-            timeout: 15000,
-            cwd: cwd || process.cwd(),
-        });
-        const text = stdout.trim();
+        const text = result.stdout.trim();
         if (!text) return { ok: false, code: "no_apphost", message: "No running AppHost found in this workspace." };
         const data = JSON.parse(text);
         const resources = Array.isArray(data) ? data : (data.resources ?? data.items ?? []);
         return { ok: true, resources, apphostPath: selected.apphostPath, apphostSource: selected.source };
     } catch (e) {
-        const msg = (e.stderr || e.message || String(e));
+        const msg = (e.message || String(e));
         return { ok: false, code: "error", message: msg.slice(0, 300) };
     }
 }
@@ -695,8 +726,15 @@ const APP_JS = `
   var selected = null;
   var noAppHostVisible = false;
   var showingError = false; // prevents SSE from clobbering an explicit error state
+  var startWaitInterval = null;
   var collapsedByName = Object.create(null);
   var activeCommandContext = null;
+
+  function clearStartWaitInterval() {
+    if (!startWaitInterval) return;
+    clearInterval(startWaitInterval);
+    startWaitInterval = null;
+  }
 
   function stateClass(s) {
     s = (s || '').toLowerCase();
@@ -1123,6 +1161,7 @@ const APP_JS = `
   function setResources(resources) {
     allResources = resources;
     noAppHostVisible = false;
+    clearStartWaitInterval();
     applyFilter();
     var grouped = splitGroups(resources);
     setStatus(grouped.resources.length + ' resources · ' + grouped.parameters.length + ' parameters · ' + new Date().toLocaleTimeString());
@@ -1335,6 +1374,7 @@ const APP_JS = `
   }
 
   function showNoAppHost() {
+    clearStartWaitInterval();
     if (noAppHostVisible) return;
     noAppHostVisible = true;
     document.getElementById('content').innerHTML =
@@ -1366,6 +1406,7 @@ const APP_JS = `
   }
 
   window.doStart = function() {
+    clearStartWaitInterval();
     var btn = document.getElementById('startBtn');
     if (btn) { btn.disabled = true; btn.textContent = 'Starting…'; }
     noAppHostVisible = false;
@@ -1381,12 +1422,16 @@ const APP_JS = `
           document.getElementById('content').innerHTML =
             '<div class="empty"><span class="spinner"></span><span>Waiting for resources…</span></div>';
           var attempts = 0;
-          var waitId = setInterval(function() {
+          startWaitInterval = setInterval(function() {
             attempts++;
             window.doRefresh();
-            if (attempts >= 20) { clearInterval(waitId); showNoAppHost(); }
+            if (attempts >= 20) {
+              clearStartWaitInterval();
+              if (!Array.isArray(allResources) || allResources.length === 0) showNoAppHost();
+            }
           }, 2000);
         } else {
+          clearStartWaitInterval();
           if (data.code === 'no_workspace_apphost') {
             showNoAppHost();
             setStatus(data.message || 'No workspace AppHost found to start', true);
@@ -1396,6 +1441,7 @@ const APP_JS = `
           }
         }
       }).catch(function() {
+        clearStartWaitInterval();
         showStartError('Could not reach the canvas server.');
         setStatus('Start failed', true);
       });
@@ -1408,7 +1454,10 @@ const APP_JS = `
       .then(function(r) { return r.json(); })
       .then(function(data) {
         if (data.ok) { setResources(data.resources); }
-        else if (data.code === 'no_apphost') { showNoAppHost(); setStatus('No workspace AppHost running'); }
+        else if (data.code === 'no_apphost') {
+          if (!startWaitInterval) showNoAppHost();
+          setStatus(startWaitInterval ? 'Waiting for resources…' : 'No workspace AppHost running');
+        }
         else {
           document.getElementById('content').innerHTML =
             '<div class="empty"><span class="empty-icon">🔴</span><span>' + attr(data.message || 'Error') + '</span></div>';
