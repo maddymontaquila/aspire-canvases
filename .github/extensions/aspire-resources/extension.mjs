@@ -1767,6 +1767,11 @@ const APP_JS = `
   // Script loads at end of body — DOM is ready
   connectSSE();
   window.doRefresh();
+  // Seed the dashboard button with the currently-selected AppHost URL
+  fetch('/api/apphosts')
+    .then(function(r) { return r.json(); })
+    .then(function(data) { if (data && data.ok) updateDashboardBtn(data.selectedDashboardUrl || ''); })
+    .catch(function() {});
 })();
 `;
 
