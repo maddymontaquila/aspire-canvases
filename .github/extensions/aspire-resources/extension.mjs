@@ -860,7 +860,7 @@ const HTML_TEMPLATE = `<!doctype html>
     <span class="header-title">__APP_TITLE__</span>
     <div class="header-actions">
       <span id="liveDot" class="live-dot stale" title="SSE connection status"></span>
-      <a class="btn" id="dashboardBtn" href="#" target="_blank" rel="noopener" style="display:none">⎋ Open dashboard</a>
+      <button class="btn" id="dashboardBtn" onclick="openDashboard()" style="display:none">⎋ Open dashboard</button>
       <button class="btn" id="refreshBtn" onclick="doRefresh()">↻ Refresh</button>
     </div>
   </div>
@@ -1328,16 +1328,23 @@ const APP_JS = `
     el.className = 'status-text' + (isError ? ' error' : '');
   }
 
+  var _dashboardUrl = '';
+
   function updateDashboardBtn(url) {
+    _dashboardUrl = url || '';
     var btn = document.getElementById('dashboardBtn');
     if (!btn) return;
-    if (url) {
-      btn.href = url;
-      btn.style.display = '';
-    } else {
-      btn.style.display = 'none';
-    }
+    btn.style.display = _dashboardUrl ? '' : 'none';
   }
+
+  window.openDashboard = function() {
+    if (!_dashboardUrl) return;
+    fetch('/api/open-url', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ url: _dashboardUrl }),
+    }).catch(function() {});
+  };
 
   window.showApphostSwitcher = function() {
     var modal = document.getElementById('apphostModal');
@@ -2190,6 +2197,18 @@ async function startServer(instanceId, apphost, cwd, branding) {
         if (req.method === "GET" && path === "/app.js") {
             res.writeHead(200, { "Content-Type": "application/javascript; charset=utf-8" });
             return res.end(APP_JS);
+        }
+
+        if (req.method === "POST" && path === "/api/open-url") {
+            const body = await readJsonBody(req);
+            const url = String(body?.url || "").trim();
+            res.writeHead(200, { "Content-Type": "application/json" });
+            if (url.startsWith("http://") || url.startsWith("https://")) {
+                const opener = process.platform === "win32" ? "cmd" : process.platform === "darwin" ? "open" : "xdg-open";
+                const args = process.platform === "win32" ? ["/c", "start", url] : [url];
+                spawn(opener, args, { detached: true, stdio: "ignore" });
+            }
+            return res.end(JSON.stringify({ ok: true }));
         }
 
         if (req.method === "GET" && path === "/api/resources") {
