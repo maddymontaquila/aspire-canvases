@@ -1858,6 +1858,30 @@ const TRACES_HTML_TEMPLATE = `<!doctype html>
       font-family: var(--font-mono, monospace);
       background: var(--background-color-subtle, var(--kg-panel));
     }
+    #detail {
+      position: fixed; bottom: 0; left: 0; right: 0;
+      background: var(--kg-bg);
+      border-top: 1px solid var(--kg-border);
+      box-shadow: 0 -4px 16px color-mix(in srgb, var(--kg-fg) 10%, transparent);
+      z-index: 20; max-height: 50vh; display: flex; flex-direction: column;
+    }
+    .detail-hdr {
+      display: flex; align-items: center; gap: 8px; padding: 8px 12px;
+      border-bottom: 1px solid var(--kg-border-muted); flex-shrink: 0;
+    }
+    .detail-title { flex: 1; font-weight: var(--font-weight-semibold, 600); font-size: 13px; }
+    .detail-meta { font-size: 11px; color: var(--kg-muted); }
+    .detail-body { overflow: auto; flex: 1; }
+    .detail-body table { width: 100%; border-collapse: collapse; font-size: 12px; }
+    .detail-body th {
+      text-align: left; font-size: 10px; font-weight: 600; letter-spacing: .04em;
+      text-transform: uppercase; color: var(--kg-muted);
+      padding: 6px 10px; border-bottom: 1px solid var(--kg-border);
+      position: sticky; top: 0; background: var(--kg-bg);
+    }
+    .detail-body td { padding: 5px 10px; border-bottom: 1px solid var(--kg-border-muted); }
+    .detail-body tr:hover td { background: var(--kg-hover); }
+    .span-err td { color: var(--kg-danger-fg); }
   </style>
 </head><body>
   <div class="header">
@@ -1912,6 +1936,7 @@ const TRACES_HTML_TEMPLATE = `<!doctype html>
       <pre id="logSnapshot"></pre>
     </details>
   </div>
+  <div id="detail" style="display:none"></div>
   <script src="/traces.js"></script>
 </body></html>`;
 
@@ -1927,6 +1952,7 @@ const TRACES_APP_JS = `
 (function() {
   var current = null;
   var currentLogs = [];
+  var allTraces = [];
 
   function setStatus(msg, isError) {
     var el = document.getElementById('statusText');
@@ -1975,6 +2001,53 @@ const TRACES_APP_JS = `
     openUrl(btn.dataset.url || '');
   };
 
+  window.showDetail = function(traceId) {
+    var trace = allTraces.find(function(t) { return t.traceId === traceId; });
+    var panel = document.getElementById('detail');
+    if (!panel || !trace) return;
+    var spans = Array.isArray(trace.spans) ? trace.spans : [];
+    var dur = trace.durationMs != null ? trace.durationMs + 'ms' : '';
+    var ts = trace.timestamp ? new Date(trace.timestamp).toLocaleTimeString() : '';
+    var dashUrl = trace.dashboardUrl || '';
+    var rows = spans.map(function(s) {
+      var sc = Number(s.attributes && s.attributes['http.status_code']);
+      var isErr = s.hasError || (sc >= 400);
+      var statusCell = s.attributes && s.attributes['http.status_code']
+        ? text(String(s.attributes['http.status_code']))
+        : (isErr ? '<span style="color:var(--kg-danger-fg)">err</span>' : '—');
+      return '<tr' + (isErr ? ' class="span-err"' : '') + '>' +
+        '<td>' + text(s.source || '') + '</td>' +
+        '<td>' + text(s.name || '') + '</td>' +
+        '<td class="muted">' + text(s.kind || '') + '</td>' +
+        '<td>' + text(s.durationMs != null ? s.durationMs + 'ms' : '—') + '</td>' +
+        '<td>' + statusCell + '</td>' +
+      '</tr>';
+    }).join('');
+    var openBtn = dashUrl
+      ? '<button class="btn" data-url="' + attr(dashUrl) + '" onclick="openBtnUrl(this)">⎋ Open in dashboard</button>'
+      : '';
+    panel.innerHTML =
+      '<div class="detail-hdr">' +
+        '<span class="detail-title">' + text(trace.title || trace.traceId) + '</span>' +
+        '<span class="detail-meta">' + text(dur) + (ts ? ' · ' + text(ts) : '') + '</span>' +
+        openBtn +
+        '<button class="btn" onclick="window.closeDetail()">✕</button>' +
+      '</div>' +
+      '<div class="detail-body">' +
+        '<table><thead><tr>' +
+          '<th>Service</th><th>Operation</th><th>Kind</th><th>Duration</th><th>Status</th>' +
+        '</tr></thead>' +
+        '<tbody>' + (rows || '<tr><td colspan="5" class="muted" style="padding:10px">No span data.</td></tr>') + '</tbody>' +
+        '</table>' +
+      '</div>';
+    panel.style.display = 'flex';
+  };
+
+  window.closeDetail = function() {
+    var panel = document.getElementById('detail');
+    if (panel) panel.style.display = 'none';
+  };
+
   function setButtonLink(id, href) {
     var el = document.getElementById(id);
     if (!el) return;
@@ -2018,6 +2091,7 @@ const TRACES_APP_JS = `
 
   function renderTraces(traces) {
     var rows = Array.isArray(traces) ? traces : [];
+    allTraces = rows;
     var body = document.getElementById('tracesBody');
     var tableWrap = document.getElementById('tableWrap');
     var empty = document.getElementById('empty');
@@ -2031,9 +2105,8 @@ const TRACES_APP_JS = `
       var title = t && t.title ? String(t.title) : '(untitled trace)';
       var status = t && t.hasError ? '<span class="badge err">Error</span>' : '<span class="badge ok">OK</span>';
       var source = firstSource(t);
-      var detailUrl = t && t.dashboardUrl ? String(t.dashboardUrl) : '';
-      var detailLink = detailUrl
-        ? '<button class="btn" data-url="' + attr(detailUrl) + '" onclick="openUrl(this.dataset.url)">Open</button>'
+      var detailBtn = traceId
+        ? '<button class="btn" data-traceid="' + attr(traceId) + '" onclick="window.showDetail(this.dataset.traceid)">Details</button>'
         : '<span class="muted">—</span>';
       return '<tr>' +
         '<td><div class="trace-title">' + text(title) + '</div><div class="muted mono">' + text(source) + '</div></td>' +
@@ -2041,7 +2114,7 @@ const TRACES_APP_JS = `
         '<td>' + text(fmtDuration(t && t.durationMs)) + '</td>' +
         '<td>' + text(fmtTime(t && t.timestamp)) + '</td>' +
         '<td>' + status + '</td>' +
-        '<td>' + detailLink + '</td>' +
+        '<td>' + detailBtn + '</td>' +
       '</tr>';
     }).join('');
     empty.style.display = 'none';
@@ -2174,6 +2247,7 @@ const TRACES_APP_JS = `
   document.getElementById('searchFilter').addEventListener('keydown', function(evt) { if (evt.key === 'Enter') refresh(); });
   document.getElementById('limitSelect').addEventListener('change', refresh);
   document.getElementById('errOnly').addEventListener('change', refresh);
+  document.addEventListener('keydown', function(evt) { if (evt.key === 'Escape') window.closeDetail(); });
 
   loadApphosts();
   refresh();
