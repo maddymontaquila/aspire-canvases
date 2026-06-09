@@ -2105,7 +2105,7 @@ const TRACES_APP_JS = `
       var title = t && t.title ? String(t.title) : '(untitled trace)';
       var status = t && t.hasError ? '<span class="badge err">Error</span>' : '<span class="badge ok">OK</span>';
       var source = firstSource(t);
-      return '<tr style="cursor:pointer" onclick="window.showDetail(\'' + attr(traceId) + '\')">' +
+      return '<tr style="cursor:pointer" data-traceid="' + attr(traceId) + '" onclick="window.showDetail(this.dataset.traceid)">' +
         '<td><div class="trace-title">' + text(title) + '</div><div class="muted mono">' + text(source) + '</div></td>' +
         '<td class="mono">' + text(traceId) + '</td>' +
         '<td>' + text(fmtDuration(t && t.durationMs)) + '</td>' +
