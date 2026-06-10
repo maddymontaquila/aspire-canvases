@@ -92,7 +92,10 @@ async function startServer(instanceId, apphost, cwd, branding) {
         if (req.method === "GET" && path === "/api/apphosts") {
             const apphosts = await listAppHostCandidates(cwd);
             const canStartWorkspace = await canStartWorkspaceAppHost(cwd);
-            const selectedDashboardUrl = (apphosts.find((h) => h.apphostPath === selectedApphost) || {}).dashboardUrl || "";
+            // When nothing is explicitly selected, resources come from the
+            // effective workspace AppHost, so surface its dashboard URL too.
+            const effectivePath = selectedApphost || (apphosts.find((h) => h.fromWorkspace) || {}).apphostPath || "";
+            const selectedDashboardUrl = (apphosts.find((h) => h.apphostPath === effectivePath) || {}).dashboardUrl || "";
             res.writeHead(200, { "Content-Type": "application/json" });
             return res.end(JSON.stringify({ ok: true, apphosts, selectedApphost: selectedApphost || "", selectedDashboardUrl, canStartWorkspace }));
         }
